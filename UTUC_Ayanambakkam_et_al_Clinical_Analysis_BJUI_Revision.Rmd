@@ -1,0 +1,1036 @@
+---
+title: "Ayanambakkam et al. — ctDNA in UTUC: Clinical Analysis (BJUI revision)"
+author: "George Laliotis, MD"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    code_download: true
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+---
+
+```{=html}
+<style>
+h1 { color:#1F4E9C; border-bottom:2px solid #1F4E9C; padding-bottom:4px; margin-top:40px; }
+h2 { color:#2C3E50; }
+.reviewer { border-left:5px solid #C0392B; background:#FDF2F0; padding:10px 14px; margin:12px 0; border-radius:4px; }
+.note     { border-left:5px solid #1F4E9C; background:#EEF3FB; padding:10px 14px; margin:12px 0; border-radius:4px; }
+.flag     { border-left:5px solid #E67E22; background:#FEF5E7; padding:10px 14px; margin:12px 0; border-radius:4px; }
+</style>
+```
+
+# 0. Purpose of the document and initial set-up
+
+* **Scripts** — Clinical analysis of tumor-informed ctDNA (Signatera) in stage I–III UTUC (Ayanambakkam et al., *BJU International*, revision).
+* **Output** — Figures and tables for the revised manuscript (Sections 1–8) and the supplementary analyses cited in the response to reviewers (Section 9).
+* **Data** — The six `_NEW RULES` files in `~/Downloads` (five `.csv` files and `CLIA UTUC Time dependent data_NEWRULES.xlsx`). Edit `data_dir` or the file names in the `config` chunk if they differ.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 10,
+  fig.height = 7,
+  fig.align  = "center"
+)
+```
+
+```{r libraries}
+# **Loading necessary packages**
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(lubridate)
+  library(survival)
+  library(survminer)
+  library(coxphf)
+  library(swimplot)
+  library(gtsummary)
+  library(flextable)
+  library(DT)
+  library(scales)
+  library(htmltools)
+  library(gt)          # publication tables; install.packages("gt") if needed
+})
+```
+
+```{r config}
+# **Paths to the local files in ~/Downloads and output folder**
+data_dir <- "~/Downloads"
+out_dir  <- file.path(data_dir, "UTUC_BJUI_revision_outputs")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+files <- list(
+  clin = "RWE UTUC_Clinical Data_NEW RULES.csv",
+  op   = "RWE UTUC_OP 062026 MS NEW RULES.csv",
+  mtm  = "CLIA UTUC ctDNA MTM_NEW RULES.csv",
+  vel  = "CLIA UTUC ctDNA Velocity_NEW RULES.csv",
+  td   = "CLIA UTUC Time dependent data_NEWRULES.xlsx",
+  lt   = "CLIA UTUC_Lead Time pts_062025 NEW RULES.csv"
+)
+missing <- unlist(files)[!file.exists(file.path(data_dir, unlist(files)))]
+if (length(missing) > 0) stop("Not found in ", data_dir, ": ", paste(missing, collapse = "; "))
+
+DAYS_PER_MONTH <- 30.437
+```
+
+```{r helpers}
+# **Helper functions (type conversion, formatting, plotting)**
+na_strings <- c("", "NA", "N/A", "#VALUE!", "NaN")
+
+# Reads a .csv or .xlsx from data_dir as all-text columns; duplicated headers get a "_dup" suffix
+read_tab <- function(key) {
+  path <- file.path(data_dir, files[[key]])
+  repair <- function(x) make.unique(x, sep = "_dup")
+  raw <- if (grepl("\\.xlsx?$", path, ignore.case = TRUE)) {
+    read_excel(path, sheet = 1, col_types = "text", .name_repair = repair)
+  } else {
+    read_csv(path, col_types = cols(.default = col_character()), na = character(),
+             name_repair = repair, show_col_types = FALSE, locale = locale(encoding = "UTF-8"))
+  }
+  raw |>
+    mutate(across(everything(), ~ ifelse(trimws(.x) %in% na_strings, NA_character_, trimws(.x)))) |>
+    as.data.frame()
+}
+to_num <- function(x) suppressWarnings(as.numeric(x))
+to_lgl <- function(x) toupper(trimws(as.character(x))) %in% c("TRUE", "1", "YES")
+
+# Handles Excel serials (e.g. 43523), m/d/Y, m/d/y and Y-m-d strings
+parse_date_any <- function(x) {
+  x   <- trimws(as.character(x))
+  out <- as.Date(rep(NA_character_, length(x)))
+  is_serial <- !is.na(x) & grepl("^\\d{5}(\\.\\d+)?$", x)
+  out[is_serial] <- as.Date(floor(as.numeric(x[is_serial])), origin = "1899-12-30")
+  rest <- !is_serial & !is.na(x)
+  out[rest] <- as.Date(suppressWarnings(parse_date_time(x[rest], orders = c("mdY", "mdy", "Ymd"))))
+  out
+}
+
+fmt_p  <- function(p) ifelse(is.na(p), "NA", ifelse(p < 0.001, "< 0.001", sprintf("= %.3f", p)))
+fmt_hr <- function(hr, lo, hi, p) sprintf("HR = %.2f (95%% CI %.2f–%.2f); P %s", hr, lo, hi, fmt_p(p))
+
+cox_tidy <- function(fit, label = NULL) {
+  s <- summary(fit)
+  tibble(term = rownames(s$conf.int), HR = s$conf.int[, 1], lower = s$conf.int[, 3],
+         upper = s$conf.int[, 4], p = s$coefficients[, "Pr(>|z|)"],
+         method = "Cox PH (Wald CI)", n = fit$n, events = fit$nevent, model = label)
+}
+firth_tidy <- function(fit, label = NULL) {
+  tibble(term = names(fit$coefficients), HR = exp(fit$coefficients),
+         lower = fit$ci.lower, upper = fit$ci.upper, p = fit$prob,
+         method = "Firth penalized Cox (profile-likelihood CI)", model = label)
+}
+show_tbl <- function(df, caption = NULL, digits = 3) {
+  df <- df |> mutate(across(where(is.double), ~ round(.x, digits)))
+  datatable(df, caption = caption, rownames = FALSE, filter = "top",
+            extensions = "Buttons",
+            options = list(dom = "Bfrtip", buttons = c("copy", "csv", "excel"),
+                           pageLength = 25, scrollX = TRUE))
+}
+
+pal_ctdna <- c("#1F4E9C", "#C0392B")          # Negative, Positive
+theme_utuc <- function(base = 12) {
+  theme_bw(base_size = base) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey90", linewidth = 0.3),
+          plot.title = element_text(face = "bold"),
+          legend.position = "bottom")
+}
+save_fig <- function(p, name, w = 10, h = 7) {
+  ggsave(file.path(out_dir, paste0(name, ".pdf")), p, width = w, height = h)
+  ggsave(file.path(out_dir, paste0(name, ".png")), p, width = w, height = h, dpi = 300)
+}
+
+# Standard KM + Cox + Firth + Fisher bundle. d must have: time (months), event (0/1), group (factor)
+km_bundle <- function(d, title, xlab, break_by, times, legend = c("ctDNA Negative", "ctDNA Positive")) {
+  keep <- complete.cases(d[, c("time", "event", "group")]) & d$time > 0
+  if (any(!keep)) {
+    warning("km_bundle: dropped ", sum(!keep), " row(s) with missing or non-positive time: ",
+            paste(d$Patient.ID[!keep], collapse = ", "))
+    d <- d[keep, , drop = FALSE]
+  }
+  d <- as.data.frame(d)
+  d$group <- droplevels(d$group)
+  fit_km <- survfit(Surv(time, event) ~ group, data = d, conf.type = "log-log")   # log-log CIs as in the manuscript
+  km <- ggsurvplot(fit_km, data = d, pval = FALSE, conf.int = FALSE, risk.table = TRUE,
+                   break.time.by = break_by, palette = pal_ctdna, title = title,
+                   ylab = "Recurrence-Free Survival", xlab = xlab,
+                   legend.labs = legend, legend.title = "", ggtheme = theme_utuc(),
+                   risk.table.height = 0.25)
+  cox   <- coxph(Surv(time, event) ~ group, data = d)
+  firth <- coxphf(Surv(time, event) ~ group, data = d)
+  tab   <- table(d$group, factor(d$event, levels = c(0, 1), labels = c("No Recurrence", "Recurrence")))
+  list(km = km, fit_km = fit_km,
+       km_times = summary(fit_km, times = times, extend = TRUE),
+       cox = cox, firth = firth,
+       hr = bind_rows(cox_tidy(cox), firth_tidy(firth)),
+       zph = cox.zph(cox), table = tab, fisher = fisher.test(tab),
+       events = d |> group_by(group) |>
+         summarise(Total = n(), Events = sum(event), `Event rate (%)` = round(100 * mean(event), 1), .groups = "drop"))
+}
+
+stacked_bar <- function(tab, title) {
+  df <- as.data.frame(tab) |> group_by(Var1) |> mutate(Pct = Freq / sum(Freq)) |> ungroup()
+  ft <- fisher.test(tab)
+  ggplot(df, aes(Var1, Pct, fill = Var2)) +
+    geom_col(width = 0.65, colour = "white") +
+    geom_text(aes(label = Freq), position = position_stack(vjust = 0.5), size = 6, colour = "white", fontface = "bold") +
+    scale_y_continuous(labels = percent_format()) +
+    scale_fill_manual(values = c("No Recurrence" = pal_ctdna[1], "Recurrence" = pal_ctdna[2])) +
+    labs(title = title, x = "ctDNA", y = "Patients (%)", fill = NULL,
+         caption = paste0("Fisher's exact test P ", fmt_p(ft$p.value))) +
+    theme_utuc(14)
+}
+
+forest_plot <- function(tbl, title) {
+  tbl <- tbl |> mutate(label = factor(label, levels = rev(unique(label))))
+  ggplot(tbl, aes(x = HR, y = label)) +
+    geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+    geom_linerange(aes(xmin = lower, xmax = upper), linewidth = 0.8) +
+    geom_point(shape = 15, size = 3.5, colour = pal_ctdna[2]) +
+    geom_text(aes(label = sprintf("%.2f (%.2f–%.2f)", HR, lower, upper)),
+              x = log10(max(tbl$upper, na.rm = TRUE) * 6), hjust = 1, size = 3.3) +
+    scale_x_log10(expand = expansion(mult = c(0.05, 0.6))) +
+    labs(title = title, x = "Hazard ratio (log scale)", y = NULL) +
+    theme_utuc()
+}
+```
+
+```{r load-data}
+# **Load and type the NEW RULES tabs**
+clin <- read_tab("clin") |>
+  mutate(across(c(Age, RFS, RFS.months, OS.months, ctDNA.timing, Nsurvtps), to_num),
+         across(c(Short.cohort, Final.cohort, NAC, ACT, RFS.Event, OS.Event), to_lgl),
+         across(c(Surgery.Date, RFS.Date, OS.Date, LastFU), parse_date_any),
+         Stage  = factor(Stage,  levels = c("0/I", "II", "III")),
+         cStage = factor(cStage, levels = c("0/I", "II/III")))
+
+cohort <- clin |> filter(Final.cohort)          # n = 39 final clinical-performance cohort
+
+op <- read_tab("op") |>
+  mutate(across(c(Short.cohort, Final.cohort, RFS.Event), to_lgl),
+         across(c(fu.diff.months, Tx_start, Tx_end, Tx_start.months, Tx_end.months,
+                  date.diff, date.diff.months, MTM.mL), to_num),
+         Event = ifelse(tolower(Event) == "death", "Death", Event),
+         ctDNA.Window = case_when(tolower(ctDNA.Window) == "on-treatment" ~ "On-treatment",
+                                  TRUE ~ ctDNA.Window),
+         is_ct = Event_type %in% c("ctDNA_pos", "ctDNA_neg") & !is.na(date.diff)) |>
+  filter(PatientName %in% cohort$Patient.ID)   # NB: filtering on Final.cohort would pull in a stray UTUC-057 row
+
+mtm <- read_tab("mtm") |>
+  mutate(across(c(Final.cohort, RFS.Event), to_lgl),
+         across(c(date.diff, date.diff.months, MTM.mL), to_num)) |>
+  filter(PatientName %in% cohort$Patient.ID)
+
+vel <- read_tab("vel") |>
+  mutate(across(c(Final.cohort, RFS.Event), to_lgl),
+         across(c(date.diff, date.diff.months, MTM.mL, daysCR, daysCR.months), to_num)) |>
+  filter(PatientName %in% cohort$Patient.ID)
+
+lt <- read_tab("lt") |>
+  mutate(Final.cohort = to_lgl(Final.cohort), across(c(MR, CR, LT, LT.months), to_num)) |>
+  filter(Final.cohort)
+
+td_raw <- read_tab("td")
+# The local .xlsx may label the ID column differently (e.g. "Pts.ID"); standardise to Patient.ID
+if (!"Patient.ID" %in% names(td_raw)) {
+  id_col <- grep("^(pts|patient|pt)[._ ]?id$", names(td_raw), ignore.case = TRUE, value = TRUE)[1]
+  if (is.na(id_col)) id_col <- names(td_raw)[1]
+  names(td_raw)[names(td_raw) == id_col] <- "Patient.ID"
+}
+
+cat("Final cohort:", nrow(cohort), "patients |", nrow(op), "OP rows |",
+    sum(op$is_ct), "plasma samples in OP tab\n")
+```
+
+```{r data-checks}
+# **Cohort checks (warnings only; the knit does not stop)**
+expect <- function(label, observed, expected) {
+  ok <- identical(as.integer(observed), as.integer(expected))
+  if (!ok) warning(label, ": observed ", observed, ", expected ", expected)
+  tibble(Check = label, Observed = observed, Expected = expected, OK = ok)
+}
+bind_rows(
+  expect("Final cohort (patients)", nrow(cohort), 39),
+  expect("MRD window: patients", sum(!is.na(cohort$ctDNA.MRD)), 28),
+  expect("MRD window: positive", sum(cohort$ctDNA.MRD == "POSITIVE", na.rm = TRUE), 14),
+  expect("MRD window: missing ctDNA.timing", sum(!is.na(cohort$ctDNA.MRD) & is.na(cohort$ctDNA.timing)), 0),
+  expect("Surveillance window: patients", sum(!is.na(cohort$ctDNA.Surveillance)), 31),
+  expect("Surveillance window: positive", sum(cohort$ctDNA.Surveillance == "POSITIVE", na.rm = TRUE), 16),
+  expect("Recurrences (final cohort)", sum(cohort$RFS.Event), 19)
+) |> show_tbl("Cohort checks against the counts used in the manuscript and rebuttal")
+```
+
+# 1. Figure 1 and Table 1
+
+* **Detection rates** — ctDNA detection by window (early post-operative MRD, post-definitive surveillance, any time) and by stage.
+* **Demographics** — Table 1 and a supplementary table by surveillance ctDNA status.
+
+```{r detection-rates}
+# **ctDNA Detection Rates by Window and Stage**
+detection_by_stage <- function(df, col) {
+  d <- df |> filter(!is.na(.data[[col]]))
+  bind_rows(
+    d |> group_by(Stage) |> summarise(Total = n(), Positive = sum(.data[[col]] == "POSITIVE"), .groups = "drop") |>
+      mutate(Stage = as.character(Stage)),
+    d |> summarise(Stage = "Overall", Total = n(), Positive = sum(.data[[col]] == "POSITIVE"))
+  ) |> mutate(`Rate (%)` = round(100 * Positive / Total, 2), Window = col, .before = 1)
+}
+det <- bind_rows(detection_by_stage(cohort, "ctDNA.MRD"),
+                 detection_by_stage(cohort, "ctDNA.Surveillance"),
+                 detection_by_stage(cohort, "ctDNA.anytime"))
+show_tbl(det, "ctDNA detection by window and stage (final cohort)")
+```
+
+```{r table1}
+# **Table 1 — Patient and tumor characteristics**
+t1_data <- cohort |>
+  transmute(Age, Sex = factor(Sex), `Clinical stage` = Stage,
+            `Neoadjuvant treatment` = factor(NAC, c(FALSE, TRUE), c("No", "Yes")),
+            `Adjuvant treatment`    = factor(ACT, c(FALSE, TRUE), c("No", "Yes")),
+            `Adjuvant regimen`      = factor(ACT.type),
+            Recurrence = factor(RFS.Event, c(FALSE, TRUE), c("No Recurrence", "Recurrence")),
+            `Living status` = factor(OS.Event, c(FALSE, TRUE), c("Alive", "Deceased")),
+            `Total follow-up (mo)` = OS.months)
+
+table1 <- t1_data |>
+  tbl_summary(statistic = list(all_continuous() ~ "{median} ({min} - {max})",
+                               all_categorical() ~ "{n} ({p}%)"),
+              missing = "no") |>
+  bold_labels()
+table1
+save_as_docx(as_flex_table(table1), path = file.path(out_dir, "Table1_Demographics_UTUC.docx"))
+```
+
+```{r table1-by-ctdna}
+# **Supplementary — Characteristics by ctDNA status in the post-definitive surveillance window**
+t1b <- cohort |> filter(!is.na(ctDNA.Surveillance)) |>
+  transmute(Age, Sex = factor(Sex), `Clinical stage` = Stage,
+            `Neoadjuvant treatment` = factor(NAC, c(FALSE, TRUE), c("No", "Yes")),
+            `Adjuvant treatment`    = factor(ACT, c(FALSE, TRUE), c("No", "Yes")),
+            Recurrence = factor(RFS.Event, c(FALSE, TRUE), c("No Recurrence", "Recurrence")),
+            ctDNA = factor(ctDNA.Surveillance, c("NEGATIVE", "POSITIVE"), c("ctDNA Negative", "ctDNA Positive"))) |>
+  tbl_summary(by = ctDNA, statistic = list(all_continuous() ~ "{median} ({min} - {max})",
+                                           all_categorical() ~ "{n} ({p}%)"), missing = "no") |>
+  add_overall() |> add_p() |> bold_labels()
+t1b
+save_as_docx(as_flex_table(t1b), path = file.path(out_dir, "TableS_Demographics_by_ctDNA_Surveillance.docx"))
+```
+
+# 2. Figure 1B — Overview plot
+
+Treatment, longitudinal ctDNA results, imaging and outcome for all 39 patients, stratified by clinical stage.
+
+```{r overview-plot, fig.height=12}
+# **Overview (swimmer) plot by Stage**
+op_df <- op |> mutate(Stage = factor(Stage, levels = c("I", "II", "III")))
+
+pal_events <- c(ctDNA = "black", Surgery = "black", Death = "black",
+                NED = "#27AE60", CR = "#1E8449", PR = "#F1C40F", SD = "#E67E22", PD = "#C0392B",
+                Chemotherapy = "#5DADE2", Immunotherapy = "#8E44AD", `EV-Immunotherapy` = "#1F4E9C",
+                EV = "#2E86C1", Chemoimmunotherapy = "#A569BD", `Targeted Therapy` = "#16A085",
+                Radiotherapy = "#7F8C8D")
+
+oplot <- swimmer_plot(df = op_df, id = "PatientName", end = "fu.diff.months",
+                      fill = "gray", width = .01, base_size = 14, stratify = c("Stage"))
+oplot <- oplot + theme(panel.border = element_blank()) +
+  scale_y_continuous(breaks = seq(0, 96, by = 3)) +
+  labs(x = "Patients", y = "Time from Surgery (Months)")
+
+oplot <- oplot +
+  swimmer_lines(df_lines = op_df, id = "PatientName", start = "Tx_start.months", end = "Tx_end.months",
+                name_col = "Tx_type", size = 3.5, name_alpha = 0.9) +
+  swimmer_points(df_points = op_df, id = "PatientName", time = "date.diff.months",
+                 name_shape = "Event_type", name_col = "Event", size = 3, fill = "black") +
+  scale_shape_manual(name = "Event type", values = c(1, 16, 6, 18, 4),
+                     breaks = c("ctDNA_neg", "ctDNA_pos", "Imaging", "Surgery", "Death")) +
+  scale_color_manual(name = "Event / Treatment", values = pal_events, na.value = "grey60")
+oplot
+save_fig(oplot, "Fig1B_Overview_plot", w = 12, h = 14)
+```
+
+# 3. Cohort characteristics
+
+* **Follow-up and RFS** for the full cohort
+* **Number of surveillance time points** per patient
+* **ctDNA and imaging cadence** (median of the per-patient median interval)
+
+```{r cohort-rfs}
+# **RFS and follow-up in the final cohort (n = 39)**
+cat(sprintf("Median follow-up from surgery: %.1f months (range %.1f–%.1f)\n",
+            median(cohort$OS.months), min(cohort$OS.months), max(cohort$OS.months)))
+fit_all <- survfit(Surv(RFS.months, RFS.Event) ~ 1, data = cohort, conf.type = "log-log")
+ggsurvplot(fit_all, data = cohort, risk.table = TRUE, conf.int = TRUE, palette = "#1F4E9C",
+           break.time.by = 6, title = "RFS — Final cohort (n = 39)", xlab = "Months from surgery",
+           ylab = "Recurrence-Free Survival", legend = "none", ggtheme = theme_utuc())
+summary(fit_all, times = c(12, 24, 36), extend = TRUE)
+```
+
+```{r n-timepoints}
+# **Median number of time points in the post-definitive surveillance window**
+surv_cohort <- cohort |> filter(!is.na(ctDNA.Surveillance))
+cat(sprintf("Median # of surveillance time points: %s (%s–%s), n = %d patients\n",
+            median(surv_cohort$Nsurvtps, na.rm = TRUE), min(surv_cohort$Nsurvtps, na.rm = TRUE),
+            max(surv_cohort$Nsurvtps, na.rm = TRUE), nrow(surv_cohort)))
+cat("Total plasma samples (final cohort, OP tab):", sum(op$is_ct), "\n")
+```
+
+```{r cadence}
+# **Median of median interval of ctDNA time points and radiological imaging assessment**
+median_interval_per_patient <- function(data, filter_expr) {
+  data |> filter({{ filter_expr }}) |> arrange(PatientName, date.diff) |>
+    group_by(PatientName) |> mutate(interval = date.diff - lag(date.diff)) |>
+    summarise(median_interval = median(interval, na.rm = TRUE), .groups = "drop") |>
+    filter(!is.na(median_interval))
+}
+cohort_summary <- function(pm, label) {
+  tibble(Event_Type = label, Patients = nrow(pm),
+         `Cohort median (days)` = median(pm$median_interval),
+         `Cohort median (months)` = round(median(pm$median_interval) / DAYS_PER_MONTH, 2),
+         `Min patient median` = min(pm$median_interval), `Max patient median` = max(pm$median_interval))
+}
+cad <- bind_rows(
+  cohort_summary(median_interval_per_patient(op, Event == "ctDNA"), "ctDNA — all post-op draws"),
+  cohort_summary(median_interval_per_patient(op, Event == "ctDNA" & ctDNA.Window == "Surveillance"), "ctDNA — surveillance window only"),
+  cohort_summary(median_interval_per_patient(op, Event_type == "Imaging"), "Imaging — all")
+)
+show_tbl(cad, "Assessment cadence, final cohort (the original notebook used all 76 patients; see QC note)")
+```
+
+# 4. Figure 2A — RFS by ctDNA status in the early post-operative (MRD) window
+
+Time 0 is the date of each patient's early post-operative ctDNA draw (2–16 weeks after surgery, before any adjuvant therapy).
+
+```{r fig2a}
+# **RFS by ctDNA status at the early post-operative (MRD) window**
+# Time 0 = date of the early post-operative ctDNA draw (RFS and ctDNA.timing are in days from surgery)
+d_mrd_all <- cohort |>
+  filter(!is.na(ctDNA.MRD)) |>
+  transmute(Patient.ID, ctDNA.MRD, ctDNA.timing, RFS, RFS.Event,
+            time  = (RFS - ctDNA.timing) / DAYS_PER_MONTH,
+            event = as.numeric(RFS.Event),
+            group = factor(ctDNA.MRD, levels = c("NEGATIVE", "POSITIVE")))
+
+d_mrd_excluded <- d_mrd_all |> filter(is.na(time) | is.na(event) | is.na(group) | time <= 0)
+if (nrow(d_mrd_excluded) > 0) {
+  warning("Fig 2A: excluded ", nrow(d_mrd_excluded), " patient(s) with missing ctDNA.timing/RFS: ",
+          paste(d_mrd_excluded$Patient.ID, collapse = ", "))
+  print(select(d_mrd_excluded, Patient.ID, ctDNA.MRD, ctDNA.timing, RFS, RFS.Event))
+}
+
+d_mrd <- d_mrd_all |>
+  filter(!is.na(time), !is.na(event), !is.na(group), time > 0) |>
+  select(Patient.ID, time, event, group) |>
+  as.data.frame()
+
+cat(sprintf("Fig 2A cohort: %d patients, %d events | MRD-positive %d (%d events) | MRD-negative %d (%d events)\n",
+            nrow(d_mrd), sum(d_mrd$event),
+            sum(d_mrd$group == "POSITIVE"), sum(d_mrd$event[d_mrd$group == "POSITIVE"]),
+            sum(d_mrd$group == "NEGATIVE"), sum(d_mrd$event[d_mrd$group == "NEGATIVE"])))
+
+res_mrd <- km_bundle(d_mrd, "RFS — ctDNA at the early post-operative (MRD) window",
+                     "Time from early post-operative ctDNA draw (months)", 3, c(0, 6, 12, 18))
+res_mrd$km
+show_tbl(res_mrd$events, "Events by MRD status")
+res_mrd$km_times
+summary(res_mrd$cox)
+res_mrd$firth
+show_tbl(res_mrd$hr, "Hazard ratios — MRD window")
+cat(with(cox_tidy(res_mrd$cox), fmt_hr(HR, lower, upper, p)), "\n")
+res_mrd$zph
+res_mrd$fisher
+print(stacked_bar(res_mrd$table, "ctDNA status at MRD window"))
+
+mrd_t <- cohort$ctDNA.timing[cohort$Patient.ID %in% d_mrd$Patient.ID]
+cat(sprintf("Median time from surgery to MRD draw: %s days (range %s–%s)\n", median(mrd_t), min(mrd_t), max(mrd_t)))
+```
+
+# 5. Figure 2B — RFS by ctDNA status in the post-definitive surveillance window
+
+* **Time-fixed KM / Cox / Firth** — time 0 = surgery.
+* **Time-dependent Cox** — counting-process format; time 0 = start of the post-definitive window; delayed entry at the first post-definitive draw.
+
+```{r fig2b}
+# **RFS by ctDNA status at Surveillance window (time-fixed)**
+d_surv <- surv_cohort |>
+  transmute(Patient.ID, time = RFS.months, event = as.numeric(RFS.Event),
+            group = factor(ctDNA.Surveillance, levels = c("NEGATIVE", "POSITIVE")),
+            Age, Age10 = Age / 10, cStage, NAC = factor(NAC, c(FALSE, TRUE)), ACT = factor(ACT, c(FALSE, TRUE)))
+res_surv <- km_bundle(d_surv, "RFS — ctDNA at the post-definitive surveillance window",
+                      "Time from surgery (months)", 6, c(0, 12, 18, 24))
+res_surv$km
+show_tbl(res_surv$events, "Events by surveillance status")
+res_surv$km_times
+summary(res_surv$cox)
+res_surv$firth
+show_tbl(res_surv$hr, "Hazard ratios — surveillance window (time-fixed)")
+res_surv$zph
+res_surv$fisher
+print(stacked_bar(res_surv$table, "ctDNA status at surveillance window"))
+```
+
+```{r td-data}
+# **Time-dependent data: long-format biomarker and survival tables**
+td <- td_raw |>
+  mutate(Final.cohort = to_lgl(Final.cohort),
+         ctDNA.Surveillance.Available = to_lgl(ctDNA.Surveillance.Available),
+         Window.Start.Date = parse_date_any(Window.Start.Date),
+         DFS.Date = parse_date_any(DFS.Date), DFS.Event = to_num(DFS.Event)) |>
+  filter(Final.cohort, ctDNA.Surveillance.Available)
+
+# NB: the original notebook used names_pattern "surveillance_(.)_(.*)", which silently dropped
+# visits 10-12 (UTUC-010). "(\\d+)" captures all 12 visits.
+td_long <- td |>
+  select(Patient.ID, Window.Start.Date, matches("^Surveillance\\.\\d+\\.(Status|Date)$")) |>
+  pivot_longer(-c(Patient.ID, Window.Start.Date), names_to = c("visit", ".value"),
+               names_pattern = "^Surveillance\\.(\\d+)\\.(Status|Date)$") |>
+  mutate(visit = as.integer(visit), Date = parse_date_any(Date)) |>
+  filter(!is.na(Date), !is.na(Status)) |>
+  mutate(biomarker_time = as.numeric(Date - Window.Start.Date))
+
+td_surv <- td |>
+  transmute(Patient.ID, dfs_time = as.numeric(DFS.Date - Window.Start.Date), dfs_event = DFS.Event)
+
+cat("Patients:", nrow(td_surv), "| surveillance draws:", nrow(td_long),
+    "| draws before window start (dropped):", sum(td_long$biomarker_time < 0),
+    "| patients with dfs_time <= 0 (dropped):", sum(td_surv$dfs_time <= 0), "\n")
+td_long <- td_long |> filter(biomarker_time >= 0)
+td_surv <- td_surv |> filter(dfs_time > 0)
+
+build_td <- function(surv_df, bio_df, same_day_shift = 0) {
+  # same_day_shift > 0: a draw on the same day as the recurrence date is moved earlier by that
+  # many days so it is treated as preceding the event (sensitivity analysis)
+  bio <- bio_df |> left_join(surv_df, by = "Patient.ID") |>
+    mutate(biomarker_time = ifelse(biomarker_time == dfs_time & dfs_event == 1,
+                                   dfs_time - same_day_shift, biomarker_time)) |>
+    select(Patient.ID, biomarker_time, Status)
+  base <- tmerge(data1 = surv_df, data2 = surv_df, id = Patient.ID,
+                 dfs_event = event(dfs_time, dfs_event))
+  tmerge(data1 = base, data2 = bio, id = Patient.ID,
+         biomarker_status = tdc(biomarker_time, Status)) |>
+    mutate(biomarker_status = factor(biomarker_status, levels = c("NEGATIVE", "POSITIVE")))
+}
+dt_final <- build_td(td_surv, td_long)
+show_tbl(dt_final, "Counting-process (start, stop] dataset; NA status = interval before first post-definitive draw (delayed entry)")
+```
+
+```{r td-cox}
+# **Time-dependent Cox for RFS (primary, as submitted) and Firth version**
+dt_model <- dt_final |> filter(!is.na(biomarker_status))
+cat("Intervals:", nrow(dt_model), "| patients:", n_distinct(dt_model$Patient.ID),
+    "| events in model:", sum(dt_model$dfs_event), "of", sum(td_surv$dfs_event), "\n")
+
+lost <- dt_final |> filter(is.na(biomarker_status), dfs_event == 1)
+if (nrow(lost) > 0) { cat("Events occurring before the first post-definitive draw (not in risk set):\n"); print(lost) }
+
+fit_td   <- coxph(Surv(tstart, tstop, dfs_event) ~ biomarker_status, data = dt_model)
+fit_td_f <- coxphf(Surv(tstart, tstop, dfs_event) ~ biomarker_status, data = dt_model)
+summary(fit_td)
+fit_td_f
+td_hr <- bind_rows(cox_tidy(fit_td, "Time-dependent"), firth_tidy(fit_td_f, "Time-dependent"))
+show_tbl(td_hr, "Time-dependent ctDNA status — RFS")
+cat(with(cox_tidy(fit_td), fmt_hr(HR, lower, upper, p)), "\n")
+```
+
+```{r td-switches}
+# **Status transitions per patient**
+trans <- td_long |> arrange(Patient.ID, biomarker_time) |> group_by(Patient.ID) |>
+  summarise(draws = n(), first_draw_day = min(biomarker_time),
+            switches = sum(Status != lag(Status), na.rm = TRUE),
+            pattern = paste(substr(Status, 1, 3), collapse = "→"), .groups = "drop")
+show_tbl(trans, "Surveillance status sequence and number of status switches per patient")
+cat("Patients with ≥1 switch:", sum(trans$switches > 0), "| with ≥2 switches:", sum(trans$switches >= 2), "\n")
+```
+
+```{r td-sensitivity}
+# **Sensitivity 1: same-day draw treated as preceding recurrence imaging**
+dt_shift <- build_td(td_surv, td_long, same_day_shift = 0.5) |> filter(!is.na(biomarker_status))
+fit_shift   <- coxph(Surv(tstart, tstop, dfs_event) ~ biomarker_status, data = dt_shift)
+fit_shift_f <- coxphf(Surv(tstart, tstop, dfs_event) ~ biomarker_status, data = dt_shift)
+
+sens <- bind_rows(
+  bind_cols(tibble(Analysis = "Primary time-dependent (as submitted)", events = fit_td$nevent), cox_tidy(fit_td) |> select(HR, lower, upper, p)),
+  bind_cols(tibble(Analysis = "Primary time-dependent, Firth", events = fit_td$nevent), firth_tidy(fit_td_f) |> select(HR, lower, upper, p)),
+  bind_cols(tibble(Analysis = "Same-day draw precedes imaging (Cox)", events = fit_shift$nevent), cox_tidy(fit_shift) |> select(HR, lower, upper, p)),
+  bind_cols(tibble(Analysis = "Same-day draw precedes imaging (Firth)", events = fit_shift$nevent), firth_tidy(fit_shift_f) |> select(HR, lower, upper, p))
+)
+show_tbl(sens, "Time-dependent model sensitivity analyses")
+```
+
+# 6. Figure 3A/B — ctDNA dynamics in the surveillance window
+
+```{r fig3a, fig.height=6}
+# **Figure 3A — ctDNA dynamics in patients persistently ctDNA-negative during surveillance**
+dyn <- mtm |> filter(!is.na(ctDNA.Surveillance)) |>
+  group_by(PatientName) |> filter(n() >= 2) |> ungroup() |>
+  mutate(MTM_plot = ifelse(MTM.mL == 0, 0.005, MTM.mL),
+         Outcome  = factor(RFS.Event, c(FALSE, TRUE), c("No recurrence", "Recurrence")))
+
+dyn |> distinct(PatientName, ctDNA.Surveillance, Outcome) |> count(ctDNA.Surveillance, Outcome) |>
+  show_tbl("Patients per panel (≥2 post-operative time points)")
+
+plot_dyn <- function(status, title) {
+  ggplot(filter(dyn, ctDNA.Surveillance == status),
+         aes(date.diff.months, MTM_plot, group = PatientName, colour = Outcome)) +
+    geom_line(alpha = 0.8) + geom_point(size = 2) +
+    scale_y_log10(breaks = c(0.005, 0.01, 0.1, 1, 10, 100, 1000), labels = c("ND", "0.01", "0.1", "1", "10", "100", "1000")) +
+    scale_x_continuous(breaks = seq(0, 72, by = 6)) +
+    scale_colour_manual(values = c("No recurrence" = pal_ctdna[1], "Recurrence" = pal_ctdna[2])) +
+    labs(title = title, x = "Months from surgery", y = "ctDNA (MTM/mL)", colour = NULL) + theme_utuc()
+}
+p3a <- plot_dyn("NEGATIVE", "A. Persistently ctDNA-negative in surveillance"); p3a
+save_fig(p3a, "Fig3A_dynamics_negative")
+```
+
+```{r fig3b, fig.height=13, fig.width=13}
+# **Figure 3B (revised) — per-patient timelines for the 16 ctDNA-positive surveillance patients**
+pos_ids <- surv_cohort |> filter(ctDNA.Surveillance == "POSITIVE") |>
+  left_join(select(td, Patient.ID, Window.Start.Date), by = "Patient.ID") |>
+  transmute(PatientName = Patient.ID, Stage, RFS.Event, RFS.months, OS.months,
+            window_mo = as.numeric(Window.Start.Date - Surgery.Date) / DAYS_PER_MONTH) |>
+  arrange(desc(RFS.Event), RFS.months) |>
+  mutate(panel = paste0(PatientName, " | Stage ", Stage, " | ",
+                        ifelse(RFS.Event, sprintf("Recurrence at %.1f mo", RFS.months), sprintf("No recurrence (FU %.1f mo)", OS.months))),
+         panel = factor(panel, levels = panel))
+
+tl   <- op |> filter(PatientName %in% pos_ids$PatientName) |> left_join(select(pos_ids, PatientName, panel), by = "PatientName")
+ctl  <- tl |> filter(Event_type %in% c("ctDNA_pos", "ctDNA_neg")) |>
+  mutate(MTM_plot = ifelse(MTM.mL == 0 | is.na(MTM.mL), 0.005, MTM.mL),
+         Status = ifelse(Event_type == "ctDNA_pos", "ctDNA positive", "ctDNA negative"))
+txl  <- tl |> filter(!is.na(Tx_type), !is.na(Tx_start.months)) |> distinct(panel, Tx_type, Tx_start.months, Tx_end.months)
+img  <- tl |> filter(Event_type == "Imaging") |>
+  mutate(Imaging = ifelse(Event == "PD", "Imaging: progression", "Imaging: no progression (NED/CR/PR/SD)"))
+dth  <- tl |> filter(Event_type == "Death")
+
+p3b_new <- ggplot() +
+  geom_rect(data = txl, aes(xmin = Tx_start.months, xmax = pmax(Tx_end.months, Tx_start.months + 0.3),
+                            ymin = 0.002, ymax = 3000, fill = Tx_type), alpha = 0.22) +
+  geom_vline(data = pos_ids, aes(xintercept = window_mo), linetype = "dotted", colour = "grey35") +
+  geom_vline(data = filter(pos_ids, RFS.Event), aes(xintercept = RFS.months), colour = "#C0392B", linewidth = 0.9) +
+  geom_line(data = ctl, aes(date.diff.months, MTM_plot), colour = "grey25") +
+  geom_point(data = ctl, aes(date.diff.months, MTM_plot, shape = Status), size = 2.4, fill = "white") +
+  geom_point(data = img, aes(date.diff.months, 0.002, colour = Imaging), shape = 17, size = 3) +
+  geom_point(data = dth, aes(date.diff.months, 0.002), shape = 4, size = 3, stroke = 1.3) +
+  facet_wrap(~ panel, ncol = 4) +
+  scale_shape_manual(values = c("ctDNA positive" = 16, "ctDNA negative" = 21), name = NULL) +
+  scale_colour_manual(values = c("Imaging: progression" = "#C0392B", "Imaging: no progression (NED/CR/PR/SD)" = "#27AE60"), name = NULL) +
+  scale_fill_brewer(palette = "Set2", name = "Systemic / local therapy") +
+  scale_y_log10(breaks = c(0.005, 0.1, 1, 10, 100, 1000), labels = c("ND", "0.1", "1", "10", "100", "1000"),
+                limits = c(0.0015, 3000)) +
+  scale_x_continuous(breaks = seq(0, 60, by = 6)) +
+  coord_cartesian(xlim = c(0, max(c(pos_ids$OS.months, ctl$date.diff.months), na.rm = TRUE) + 1)) +
+  labs(x = "Months from surgery (common scale)", y = "ctDNA (MTM/mL, log scale)",
+       title = "ctDNA, treatment, imaging and recurrence in ctDNA-positive surveillance patients",
+       caption = "Dotted line = start of post-definitive window; red line = clinical recurrence; triangles = imaging; × = death; ND = not detected") +
+  theme_utuc(11) + theme(strip.text = element_text(size = 8.5, face = "bold"), legend.box = "vertical")
+p3b_new
+save_fig(p3b_new, "Fig3B_patient_timelines", w = 15, h = 14)
+```
+
+# 7. Figure 3C — Lead time
+
+```{r fig3c, fig.height=7}
+# **Figure 3C — lead time from first post-operative ctDNA-positive result to radiographic recurrence**
+ltd <- lt |> mutate(MR_mo = MR / DAYS_PER_MONTH, CR_mo = CR / DAYS_PER_MONTH, LT_mo = LT / DAYS_PER_MONTH,
+                    lt_cat = cut(LT_mo, c(-Inf, 3, 6, Inf), labels = c("0–3 mo", "3–6 mo", ">6 mo"))) |>
+  arrange(pmin(MR_mo, CR_mo)) |> mutate(PatientID = factor(PatientID, levels = PatientID))
+
+annot <- sprintf("Median lead time:\n%.1f months (%.1f–%.1f)\nn = %d",
+                 median(ltd$LT_mo), min(ltd$LT_mo), max(ltd$LT_mo), nrow(ltd))
+p3c <- ggplot(ltd) +
+  geom_segment(aes(x = MR_mo, xend = CR_mo, y = PatientID, yend = PatientID, colour = lt_cat), linewidth = 1.1) +
+  geom_point(aes(MR_mo, PatientID, fill = "Molecular recurrence"), shape = 21, size = 3) +
+  geom_point(aes(CR_mo, PatientID, fill = "Clinical recurrence"), shape = 21, size = 3) +
+  scale_colour_manual(values = c("0–3 mo" = "grey60", "3–6 mo" = "#85C1E9", ">6 mo" = "#1F4E9C"), name = "Lead time") +
+  scale_fill_manual(values = c("Molecular recurrence" = "#10B4C1", "Clinical recurrence" = "#C96A72"), name = NULL) +
+  annotate("label", x = max(ltd$CR_mo) * 0.70, y = levels(ltd$PatientID)[ceiling(nlevels(ltd$PatientID) * 0.3)],
+           label = annot, hjust = 0) +
+  scale_x_continuous(breaks = seq(0, 48, by = 3)) +
+  labs(x = "Months from surgery", y = NULL, title = "Lead time: molecular vs clinical recurrence") + theme_utuc()
+p3c
+save_fig(p3c, "Fig3C_lead_time")
+
+wil <- wilcox.test(ltd$CR, ltd$MR, paired = TRUE, conf.int = TRUE, exact = FALSE)
+cat(sprintf("Paired Wilcoxon: n = %d, V = %g, P %s; Hodges–Lehmann median difference = %.1f days (95%% CI %.1f–%.1f)\n",
+            nrow(ltd), wil$statistic, fmt_p(wil$p.value), wil$estimate, wil$conf.int[1], wil$conf.int[2]))
+```
+
+# 8. Figure 3D — ctDNA growth rate (continuous)
+
+```{r fig3d, fig.height=7}
+# **Figure 3D — ctDNA growth rate before clinical recurrence (per-patient log-linear fits, continuous slope)**
+preCR <- vel |> filter(daysCR.months <= 0, is.finite(MTM.mL), MTM.mL > 0)
+eligible <- preCR |> group_by(PatientName) |> filter(n() >= 2, n_distinct(daysCR.months) >= 2) |> ungroup()
+
+slopes <- eligible |> group_by(PatientName) |>
+  summarise(n_points = n(),
+            slope = coef(lm(log10(MTM.mL) ~ daysCR.months))[["daysCR.months"]],
+            lead_time_mo = -min(daysCR.months),
+            max_MTM = max(MTM.mL), .groups = "drop")
+
+pred_lines <- eligible |> group_by(PatientName) |> group_modify(function(dd, k) {
+  m <- lm(log10(MTM.mL) ~ daysCR.months, data = dd)
+  g <- tibble(daysCR.months = seq(min(dd$daysCR.months), 0, length.out = 50))
+  g |> mutate(MTM.mL = 10^predict(m, newdata = g))
+}) |> ungroup() |> left_join(select(slopes, PatientName, slope), by = "PatientName")
+
+p3d <- ggplot() +
+  geom_line(data = pred_lines, aes(daysCR.months, MTM.mL, group = PatientName, colour = slope), linewidth = 1) +
+  geom_point(data = left_join(eligible, select(slopes, PatientName, slope), by = "PatientName"),
+             aes(daysCR.months, MTM.mL, colour = slope), size = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_y_log10(labels = label_number(accuracy = 0.01)) +
+  scale_colour_gradient(low = "#85C1E9", high = "#C0392B", name = "Slope\n(log10 MTM/mL\nper month)") +
+  scale_x_continuous(breaks = seq(-24, 0, by = 3)) +
+  labs(x = "Months before clinical recurrence (0 = imaging-positive)", y = "ctDNA (MTM/mL)",
+       title = "ctDNA velocity before clinical recurrence (continuous slope)") +
+  theme_utuc() + theme(legend.position = "right")
+p3d
+save_fig(p3d, "Fig3D_velocity_continuous")
+
+cat(sprintf("Patients with ≥2 positive pre-recurrence draws: %d\n", nrow(slopes)))
+show_tbl(slopes, "Per-patient ctDNA growth rate")
+```
+
+```{r fig3d-continuous}
+# **Association between continuous ctDNA slope and lead time**
+sp <- cor.test(slopes$slope, slopes$lead_time_mo, method = "spearman", exact = FALSE)
+cat(sprintf("Spearman rho (slope vs lead time) = %.2f, P %s, n = %d\n", sp$estimate, fmt_p(sp$p.value), nrow(slopes)))
+sp2 <- cor.test(slopes$slope, log10(slopes$max_MTM), method = "spearman", exact = FALSE)
+cat(sprintf("Spearman rho (slope vs peak MTM/mL) = %.2f, P %s\n", sp2$estimate, fmt_p(sp2$p.value)))
+lm_lead <- lm(log(lead_time_mo) ~ slope, data = slopes)
+summary(lm_lead)
+cat(sprintf("Slope: median %.3f (IQR %.3f–%.3f) log10 MTM/mL per month\n",
+            median(slopes$slope), quantile(slopes$slope, 0.25), quantile(slopes$slope, 0.75)))
+
+p_slope <- ggplot(slopes, aes(slope, lead_time_mo)) +
+  geom_smooth(method = "lm", formula = y ~ x, se = TRUE, colour = "grey30", fill = "grey85") +
+  geom_point(aes(size = n_points), colour = pal_ctdna[2], alpha = 0.85) +
+  geom_text(aes(label = PatientName), vjust = -1, size = 3) +
+  scale_size_continuous(range = c(2.5, 6), name = "# pre-recurrence\npositive draws") +
+  labs(x = "ctDNA growth rate (log10 MTM/mL per month)", y = "Lead time (months, first positive → imaging)",
+       title = "Exploratory: ctDNA growth rate vs lead time (continuous)",
+       subtitle = sprintf("Spearman ρ = %.2f, P %s, n = %d", sp$estimate, fmt_p(sp$p.value), nrow(slopes))) +
+  theme_utuc() + theme(legend.position = "right")
+p_slope
+save_fig(p_slope, "Fig3D_alt_slope_vs_leadtime")
+```
+
+# 9. Supplementary analyses cited in the response to reviewers
+
+## 9.1 Recurrence site and ctDNA detection by site (Reviewer 1, comment 4)
+
+```{r recurrence-sites}
+# **Recurrence site classification (CONFIRM entries marked with a clinician)**
+site_map <- tribble(
+  ~Patient.ID, ~Site.category, ~Site.detail,
+  "UTUC-019", "Distant",      "Peritoneum",
+  "UTUC-020", "Distant",      "Lung, liver, RP node",
+  "UTUC-022", "Distant",      "Abdominal wall, bone",
+  "UTUC-026", "Locoregional", "Right psoas, distal right ureter mass",
+  "UTUC-027", "Distant",      "Right 1st rib",
+  "UTUC-028", "Distant",      "Liver, bone, lymph nodes",
+  "UTUC-031", "Distant",      "Liver, RP, serosal implants",
+  "UTUC-035", "Distant",      "Liver, RP node",
+  "UTUC-036", "Distant",      "Supraclavicular + RP LAD (supraclavicular = non-regional) — CONFIRM",
+  "UTUC-038", "Distant",      "LN + lung metastases",
+  "UTUC-039", "Distant",      "Mediastinal & AP-window LAD — CONFIRM",
+  "UTUC-043", "Distant",      "Lung & liver",
+  "UTUC-049", "Locoregional", "Adrenal + RP — CONFIRM (ipsilateral bed vs distant)",
+  "UTUC-050", "Locoregional", "Sub-cm RP node",
+  "UTUC-055", "Locoregional", "Para-aortic LN",
+  "UTUC-059", "Locoregional", "Surgical bed",
+  "UTUC-060", "Distant",      "Pubic bone",
+  "UTUC-062", "Locoregional", "Para-aortic LN",
+  "UTUC-073", "Intravesical", "Bladder (no distant disease)"
+)
+rec <- cohort |> filter(RFS.Event) |> select(Patient.ID, Stage, Recurrence.site, RFS, RFS.months, ctDNA.MRD, ctDNA.Surveillance) |>
+  left_join(site_map, by = "Patient.ID")
+if (any(is.na(rec$Site.category))) warning("Unmapped recurrences: ", paste(rec$Patient.ID[is.na(rec$Site.category)], collapse = ", "))
+
+# Was ctDNA detected in the post-definitive window before / on the recurrence date?
+first_pos <- op |> filter(Event_type == "ctDNA_pos", ctDNA.Window == "Surveillance") |>
+  group_by(PatientName) |> summarise(first_surv_pos_day = min(date.diff), .groups = "drop")
+first_pos_any <- op |> filter(Event_type == "ctDNA_pos", date.diff > 0) |>
+  group_by(PatientName) |> summarise(first_postop_pos_day = min(date.diff), .groups = "drop")
+rec <- rec |> left_join(first_pos, by = c("Patient.ID" = "PatientName")) |>
+  left_join(first_pos_any, by = c("Patient.ID" = "PatientName")) |>
+  mutate(RFS.day = RFS,
+         Surveillance.detection = case_when(is.na(ctDNA.Surveillance) ~ "Not in surveillance cohort",
+                                            is.na(first_surv_pos_day) ~ "ctDNA-negative",
+                                            first_surv_pos_day < RFS.day ~ "Detected before recurrence",
+                                            TRUE ~ "Detected at recurrence (same day)"))
+show_tbl(rec, "All recurrences in the final cohort, by anatomical site")
+
+bind_rows(
+  rec |> count(Site.category) |> mutate(Cohort = "Final cohort (n = 39)"),
+  rec |> filter(!is.na(ctDNA.Surveillance)) |> count(Site.category) |> mutate(Cohort = "Surveillance cohort (n = 31)"),
+  rec |> filter(!is.na(ctDNA.MRD)) |> count(Site.category) |> mutate(Cohort = "MRD cohort (n = 28)")
+) |> pivot_wider(names_from = Site.category, values_from = n, values_fill = 0) |> show_tbl("Recurrence site counts")
+
+rec |> filter(!is.na(ctDNA.Surveillance)) |> count(Site.category, ctDNA.Surveillance, Surveillance.detection) |>
+  show_tbl("Surveillance cohort: ctDNA detection by recurrence site")
+```
+
+```{r extravesical}
+# **Sensitivity: extravesical recurrence only (intravesical recurrence censored at its date)**
+d_extra <- d_surv |> left_join(select(rec, Patient.ID, Site.category), by = "Patient.ID") |>
+  mutate(event = ifelse(!is.na(Site.category) & Site.category == "Intravesical", 0, event))
+res_extra <- km_bundle(d_extra, "Extravesical RFS — ctDNA at surveillance", "Time from surgery (months)", 6, c(12, 24))
+res_extra$km
+show_tbl(res_extra$hr, "Extravesical RFS — surveillance ctDNA (time-fixed)")
+```
+
+## 9.2 ctDNA-positive patients without documented recurrence (Reviewer 1, comment 5)
+
+```{r discordant}
+# **Case-level summary of MRD-positive patients without recurrence**
+discordant_ids <- bind_rows(
+  cohort |> filter(ctDNA.MRD == "POSITIVE", !RFS.Event) |> transmute(Patient.ID, Window = "Early post-operative (MRD)"),
+  cohort |> filter(ctDNA.Surveillance == "POSITIVE", !RFS.Event) |> transmute(Patient.ID, Window = "Post-definitive surveillance")
+)
+ct <- op |> filter(is_ct, date.diff > 0)
+case_summary <- discordant_ids |> rowwise() |> mutate(
+  draws        = sum(ct$PatientName == Patient.ID),
+  positives    = sum(ct$PatientName == Patient.ID & ct$Event_type == "ctDNA_pos"),
+  first_pos_mo = round(min(ct$date.diff.months[ct$PatientName == Patient.ID & ct$Event_type == "ctDNA_pos"]), 1),
+  max_MTM      = max(ct$MTM.mL[ct$PatientName == Patient.ID], na.rm = TRUE),
+  MTM_series   = paste(ct$MTM.mL[ct$PatientName == Patient.ID][order(ct$date.diff[ct$PatientName == Patient.ID])], collapse = " → "),
+  last_ctDNA   = ct$Event_type[ct$PatientName == Patient.ID][which.max(ct$date.diff[ct$PatientName == Patient.ID])],
+  therapy_after_first_pos = paste(unique(op$Tx_type[which(op$PatientName == Patient.ID & !is.na(op$Tx_type) &
+                                                          op$Tx_start.months >= first_pos_mo - 0.5)]), collapse = "; "),
+  imaging_after_first_pos = paste(op$Event[which(op$PatientName == Patient.ID & op$Event_type == "Imaging" &
+                                                 op$date.diff.months >= first_pos_mo)], collapse = ", "),
+  last_imaging_mo = round(max(op$date.diff.months[op$PatientName == Patient.ID & op$Event_type == "Imaging"]), 1),
+  first_pos_to_last_imaging_mo = round(last_imaging_mo - first_pos_mo, 1),
+  follow_up_mo = round(cohort$OS.months[cohort$Patient.ID == Patient.ID], 1),
+  notes = paste(na.omit(op$Notes[op$PatientName == Patient.ID]), collapse = "; ")
+) |> ungroup() |> left_join(select(cohort, Patient.ID, Stage, ACT.Regimen), by = "Patient.ID")
+show_tbl(case_summary, "MRD-positive patients without documented recurrence")
+write_csv(case_summary, file.path(out_dir, "R1_5_discordant_cases.csv"))
+```
+
+## 9.3 Events per variable and Firth-penalized models (Reviewer 1, comment 6; Reviewer 2, comment 4)
+
+The multivariable model has been removed from the main text; these exploratory models are reported in the supplement.
+
+```{r mva-epv}
+# **Events per variable**
+epv <- tibble(
+  Model = c("Submitted MVA (ctDNA + age + stage + NAC + AT)", "Bivariable (ctDNA + 1 covariate)", "Univariable"),
+  Parameters = c(5, 2, 1), Patients = nrow(d_surv), Events = sum(d_surv$event)
+) |> mutate(EPV = round(Events / Parameters, 1))
+show_tbl(epv, "Events per variable — post-definitive surveillance cohort")
+```
+
+```{r mva-firth}
+# **Firth-penalized Cox: univariable, bivariable (one covariate at a time), and full model**
+covs <- c(Age10 = "Age (per 10 y)", cStage = "Clinical stage II/III vs 0/I",
+          NAC = "Neoadjuvant therapy", ACT = "Adjuvant therapy")
+
+uni_cov <- imap_dfr(covs, function(lbl, cv) {
+  f <- coxphf(as.formula(paste("Surv(time, event) ~", cv)), data = d_surv)
+  firth_tidy(f, paste("Univariable:", lbl))
+})
+biv <- imap_dfr(covs, function(lbl, cv) {
+  f <- coxphf(as.formula(paste("Surv(time, event) ~ group +", cv)), data = d_surv)
+  firth_tidy(f, paste("ctDNA +", lbl))
+})
+full_f <- coxphf(Surv(time, event) ~ group + Age10 + cStage + NAC + ACT, data = d_surv)
+mva_tbl <- bind_rows(firth_tidy(res_surv$firth, "Univariable: ctDNA"), uni_cov, biv,
+                     firth_tidy(full_f, "Full 5-parameter model (Firth)"))
+show_tbl(mva_tbl, "Firth-penalized Cox models — surveillance ctDNA (time-fixed, time 0 = surgery)")
+write_csv(mva_tbl, file.path(out_dir, "R1_6_Firth_models.csv"))
+
+forest_plot(biv |> filter(term == "groupPOSITIVE") |> mutate(label = model),
+            "ctDNA positivity adjusted for one covariate at a time (Firth)")
+```
+
+```{r firth-publication-table}
+# **Publication-ready table: Firth-penalized Cox models (surveillance window, time 0 = surgery)**
+term_lab <- c(groupPOSITIVE  = "ctDNA positive (vs. negative)",
+              Age10          = "Age (per 10 years)",
+              `cStageII/III` = "Clinical stage II/III (vs. 0/I)",
+              NACTRUE        = "Neoadjuvant therapy (yes vs. no)",
+              ACTTRUE        = "Adjuvant therapy (yes vs. no)")
+model_lab <- c("ctDNA + Age (per 10 y)"                       = "Adjusted for age",
+               "ctDNA + Clinical stage II/III vs 0/I"         = "Adjusted for clinical stage",
+               "ctDNA + Neoadjuvant therapy"                  = "Adjusted for neoadjuvant therapy",
+               "ctDNA + Adjuvant therapy"                     = "Adjusted for adjuvant therapy")
+fmt_est <- function(x) ifelse(x >= 100, sprintf("%.0f", x), ifelse(x >= 10, sprintf("%.1f", x), sprintf("%.2f", x)))
+fmt_pub_p <- function(p) ifelse(p < 0.001, "<0.001", sprintf("%.3f", p))
+
+n_pts <- nrow(d_surv); n_ev <- sum(d_surv$event)
+
+firth_pub <- mva_tbl |>
+  mutate(Variable = coalesce(unname(term_lab[term]), term),
+         Section  = case_when(grepl("^Univariable", model) ~ "Univariable models",
+                              grepl("^ctDNA \\+", model)   ~ "ctDNA status adjusted for one covariate at a time",
+                              TRUE                          ~ "Full model (all covariates; shown for completeness)"),
+         Section  = factor(Section, levels = c("Univariable models",
+                                               "ctDNA status adjusted for one covariate at a time",
+                                               "Full model (all covariates; shown for completeness)")),
+         Model    = case_when(grepl("^Univariable", model) ~ "Unadjusted",
+                              grepl("^ctDNA \\+", model)   ~ coalesce(unname(model_lab[model]), model),
+                              TRUE                          ~ "Mutually adjusted"),
+         EPV      = case_when(grepl("^Univariable", model) ~ n_ev / 1,
+                              grepl("^ctDNA \\+", model)   ~ n_ev / 2,
+                              TRUE                          ~ n_ev / 5),
+         `HR (95% CI)` = sprintf("%s (%s–%s)", fmt_est(HR), fmt_est(lower), fmt_est(upper)),
+         P = fmt_pub_p(p),
+         is_ctdna = term == "groupPOSITIVE",
+         is_full  = !grepl("^Univariable|^ctDNA \\+", model)) |>
+  arrange(Section) |>
+  group_by(model) |>
+  mutate(Model = ifelse(row_number() == 1, Model, ""),
+         EPV   = ifelse(row_number() == 1, sprintf("%.1f", EPV), "")) |>
+  ungroup()
+
+gt_firth <- firth_pub |>
+  select(Section, Model, Variable, `HR (95% CI)`, P, EPV, p, is_ctdna, is_full) |>
+  gt(groupname_col = "Section") |>
+  tab_header(
+    title    = md("**Firth penalized-likelihood Cox regression for recurrence-free survival**"),
+    subtitle = md(sprintf("Post-definitive treatment surveillance cohort (n = %d patients; %d events); time 0 = date of surgery",
+                          n_pts, n_ev))) |>
+  cols_label(Model = "Model", Variable = "Variable", P = md("*P*"), EPV = "Events per variable") |>
+  cols_hide(c(p, is_ctdna, is_full)) |>
+  cols_align("left",   columns = c(Model, Variable)) |>
+  cols_align("center", columns = c(`HR (95% CI)`, P, EPV)) |>
+  tab_style(style = list(cell_fill(color = "#FDF2F0"), cell_text(weight = "bold")),
+            locations = cells_body(columns = c(Variable, `HR (95% CI)`), rows = is_ctdna)) |>
+  tab_style(style = cell_text(weight = "bold"),
+            locations = cells_body(columns = P, rows = p < 0.05)) |>
+  tab_style(style = list(cell_fill(color = "#EEF3FB"), cell_text(weight = "bold", color = "#1F4E9C")),
+            locations = cells_row_groups()) |>
+  tab_style(style = cell_text(style = "italic", color = "grey40"),
+            locations = cells_body(rows = is_full)) |>
+  tab_source_note(md(paste0(
+    "HR, hazard ratio; CI, profile-likelihood confidence interval. Hazard ratios were estimated with Firth's ",
+    "penalized-likelihood Cox regression (R package coxphf). ctDNA status was defined in the post-definitive ",
+    "treatment surveillance window. Bold *P* values are < 0.05. Given the small number of events, these models ",
+    "are exploratory; the full model (events per variable 2.8) is shown for completeness and is not interpreted."))) |>
+  tab_options(table.font.names = c("Arial", "Helvetica", "sans-serif"),
+              table.font.size = px(13),
+              heading.align = "left",
+              heading.title.font.size = px(16),
+              heading.subtitle.font.size = px(13),
+              column_labels.font.weight = "bold",
+              column_labels.border.top.color = "black",
+              column_labels.border.bottom.color = "black",
+              table.border.top.color = "white",
+              table.border.bottom.color = "black",
+              row_group.border.top.color = "grey70",
+              row_group.border.bottom.color = "grey70",
+              data_row.padding = px(4),
+              source_notes.font.size = px(11))
+gt_firth
+
+# Exports: Word (editable), HTML, and PNG (PNG needs the webshot2 package + Chrome)
+gtsave(gt_firth, file.path(out_dir, "Table_Firth_models_surveillance.docx"))
+gtsave(gt_firth, file.path(out_dir, "Table_Firth_models_surveillance.html"))
+tryCatch(gtsave(gt_firth, file.path(out_dir, "Table_Firth_models_surveillance.png"), expand = 20, zoom = 3),
+         error = function(e) message("PNG export skipped (install webshot2): ", conditionMessage(e)))
+```
+
+```{r firth-publication-forest, fig.width=11, fig.height=5}
+# **Figure version: ctDNA hazard ratio across Firth models, with estimates printed alongside**
+forest_df <- firth_pub |>
+  filter(is_ctdna) |>
+  mutate(label = case_when(Section == "Univariable models" ~ "Unadjusted",
+                           grepl("one covariate", Section) ~ Model,
+                           TRUE ~ "Mutually adjusted (all covariates)"),
+         label = factor(label, levels = rev(label)),
+         kind  = ifelse(label == "Mutually adjusted (all covariates)", "Full model", "Primary / one-covariate"))
+
+x_txt1 <- 600; x_txt2 <- 6000
+p_forest_firth <- ggplot(forest_df, aes(x = HR, y = label)) +
+  annotate("rect", xmin = 0.3, xmax = 400, ymin = -Inf, ymax = Inf, fill = "grey97") +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+  geom_linerange(aes(xmin = lower, xmax = upper, colour = kind), linewidth = 1) +
+  geom_point(aes(colour = kind), shape = 15, size = 4) +
+  geom_text(aes(x = x_txt1, label = `HR (95% CI)`), hjust = 0, size = 4) +
+  geom_text(aes(x = x_txt2, label = P), hjust = 0, size = 4) +
+  annotate("text", x = x_txt1, y = nrow(forest_df) + 0.8, label = "HR (95% CI)", hjust = 0, fontface = "bold", size = 4) +
+  annotate("text", x = x_txt2, y = nrow(forest_df) + 0.8, label = "P", hjust = 0, fontface = "bold.italic", size = 4) +
+  scale_x_log10(breaks = c(0.5, 1, 2, 5, 10, 20, 50, 100, 200), labels = c("0.5", "1", "2", "5", "10", "20", "50", "100", "200")) +
+  scale_colour_manual(values = c("Primary / one-covariate" = pal_ctdna[2], "Full model" = "grey55"), guide = "none") +
+  coord_cartesian(xlim = c(0.3, 400), ylim = c(0.5, nrow(forest_df) + 1), clip = "off") +
+  labs(x = "Hazard ratio for ctDNA positivity (log scale)", y = NULL,
+       title = "ctDNA positivity and RFS across Firth penalized Cox models",
+       subtitle = sprintf("Post-definitive surveillance cohort (n = %d; %d events); time 0 = surgery", n_pts, n_ev),
+       caption = "HR > 1 indicates shorter RFS for ctDNA-positive patients. Profile-likelihood 95% CIs.") +
+  theme_utuc(13) +
+  theme(plot.margin = margin(10, 160, 10, 10), panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(size = 12, colour = "black"))
+p_forest_firth
+save_fig(p_forest_firth, "Fig_Firth_ctDNA_forest_surveillance", w = 11, h = 5)
+```
+
+```{r mva-td-firth}
+# **Time-dependent ctDNA with Firth penalization, adjusted for one covariate at a time**
+dt_cov <- dt_model |> left_join(select(d_surv, Patient.ID, Age10, cStage, NAC, ACT), by = "Patient.ID")
+td_biv <- imap_dfr(covs, function(lbl, cv) {
+  f <- coxphf(as.formula(paste("Surv(tstart, tstop, dfs_event) ~ biomarker_status +", cv)), data = dt_cov)
+  firth_tidy(f, paste("Time-dependent ctDNA +", lbl))
+})
+show_tbl(bind_rows(firth_tidy(fit_td_f, "Time-dependent ctDNA (univariable)"), td_biv),
+         "Firth-penalized time-dependent Cox models")
+```
+
+## 9.4 Pre-operative ctDNA (Reviewer 2, comment 3)
+
+```{r preop}
+# **Patients with a pre-operative plasma sample**
+pre <- op |> filter(is_ct, date.diff <= 0) |>
+  transmute(PatientName, preop_day = date.diff, preop_window = ctDNA.Window,
+            preop_status = ifelse(Event_type == "ctDNA_pos", "POSITIVE", "NEGATIVE"), preop_MTM = MTM.mL)
+post <- op |> filter(is_ct, date.diff > 0) |>
+  arrange(PatientName, date.diff) |> group_by(PatientName) |>
+  summarise(first_postop_day = first(date.diff), first_postop_status = ifelse(first(Event_type) == "ctDNA_pos", "POSITIVE", "NEGATIVE"),
+            first_postop_MTM = first(MTM.mL), any_postop_pos = any(Event_type == "ctDNA_pos"), .groups = "drop")
+preop_tbl <- pre |> left_join(post, by = "PatientName") |>
+  left_join(select(cohort, Patient.ID, Stage, NAC, ctDNA.Baseline, ctDNA.MRD, RFS.Event, RFS.months), by = c("PatientName" = "Patient.ID")) |>
+  mutate(pattern = case_when(preop_status == "POSITIVE" & first_postop_status == "POSITIVE" ~ "Persistent",
+                             preop_status == "POSITIVE" & first_postop_status == "NEGATIVE" ~ "Cleared post-op",
+                             preop_status == "NEGATIVE" & first_postop_status == "POSITIVE" ~ "Neg → Pos",
+                             TRUE ~ "Negative pre & post"))
+show_tbl(preop_tbl, "Pre-operative vs first post-operative ctDNA")
+
+# Clinical-tab baseline calls without a matching OP pre-operative sample
+cohort |> filter(!is.na(ctDNA.Baseline), !Patient.ID %in% pre$PatientName) |>
+  select(Patient.ID, ctDNA.Baseline, ctDNA.MRD, ctDNA.timing) |> show_tbl("QC — baseline call in clinical tab but no pre-op sample in OP tab")
+```
+
+## 9.5 Time origin and event definition (Reviewer 2, comment 5)
+
+```{r time-origins}
+# **Time origin and event definition for each RFS analysis**
+tibble(
+  Analysis = c("Fig 2A (early post-operative MRD window)", "Fig 2B (post-definitive window, time-fixed)",
+               "Time-dependent Cox (serial post-definitive ctDNA)", "Lead time (Fig 3C)"),
+  `Time 0` = c("Date of the early post-operative ctDNA draw (2–16 weeks, before any adjuvant therapy)",
+               "Date of surgery",
+               "Start of post-definitive window (end of adjuvant therapy, or surgery if none); delayed entry at first draw",
+               "First post-operative ctDNA-positive result"),
+  Event = c(rep("First recurrence at any site (intravesical, locoregional, distant); censored at last follow-up", 3),
+            "Radiographic recurrence"),
+  `Patients / events` = c(sprintf("%d / %d", nrow(d_mrd), sum(d_mrd$event)),
+                          sprintf("%d / %d", nrow(d_surv), sum(d_surv$event)),
+                          sprintf("%d / %d", n_distinct(dt_model$Patient.ID), sum(dt_model$dfs_event)),
+                          sprintf("%d recurrences", nrow(ltd)))
+) |> show_tbl("Time origin and event definition per analysis")
+cat("Deaths without prior recurrence in the final cohort:", sum(cohort$OS.Event & !cohort$RFS.Event), "\n")
+```
+
+# 10. Session info
+
+```{r session}
+sessionInfo()
+```
